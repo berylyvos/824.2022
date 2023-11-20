@@ -10,32 +10,40 @@ import (
 	"sync/atomic"
 )
 
-type FileState struct {
-	started bool
-	idx     int
-}
-
 type Coordinator struct {
-	fileMap map[string]*FileState
-	mu      *sync.Mutex
-
-	mapDone       atomic.Bool
-	mapTaskCnt    atomic.Int32
+	files         []string
+	fileIdx       int
+	mu            *sync.RWMutex
+	cmu           *sync.Mutex
+	cond          *sync.Cond
+	mapTaskCnt    int
 	reduceTaskCnt atomic.Int32
-
-	wg *sync.WaitGroup
+	wg            *sync.WaitGroup
 }
 
 // Your code here -- RPC handlers for the worker to call.
 func (c *Coordinator) HandleTaskRequest(args *TaskArg, reply *TaskReply) error {
 	if args.TaskDone {
 		c.wg.Done()
-		if !c.mapDone.Load() && c.mapTaskCnt.Add(-1) == 0 {
-			c.mapDone.Store(true)
+		c.cmu.Lock()
+		c.mapTaskCnt--
+		if c.mapTaskCnt == 0 {
+			c.cond.Broadcast()
 		}
+		c.cmu.Unlock()
 	}
 
-	if c.mapDone.Load() {
+	c.mu.RLock()
+	idx := c.fileIdx
+	c.mu.RUnlock()
+
+	if idx >= NMap {
+		c.cmu.Lock()
+		for c.mapTaskCnt > 0 {
+			c.cond.Wait()
+		}
+		c.cmu.Unlock()
+
 		reduceIdx := c.reduceTaskCnt.Add(-1)
 		if reduceIdx < 0 {
 			reply.Type = kTaskTypeNone
@@ -47,23 +55,13 @@ func (c *Coordinator) HandleTaskRequest(args *TaskArg, reply *TaskReply) error {
 		}
 	} else {
 		c.mu.Lock()
-		for fn, st := range c.fileMap {
-			if !st.started {
-				reply.Type = kTaskTypeMap
-				reply.InputFileName = fn
-				reply.TaskIndex = c.fileMap[fn].idx
-				c.fileMap[fn].started = true
-				break
-			}
-		}
+		reply.TaskIndex = c.fileIdx
+		reply.InputFileName = c.files[c.fileIdx]
+		c.fileIdx++
 		c.mu.Unlock()
 
-		if reply.InputFileName == "" {
-			reply.Type = kTaskTypeWait
-			log.Printf("Wait task -> worker [%v]", args.WorkerPid)
-		} else {
-			log.Printf("Map task #%v -> worker [%v]", reply.TaskIndex, args.WorkerPid)
-		}
+		reply.Type = kTaskTypeMap
+		log.Printf("Map task #%v -> worker [%v]", reply.TaskIndex, args.WorkerPid)
 	}
 
 	return nil
@@ -105,17 +103,16 @@ func (c *Coordinator) Done() bool {
 // nReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{
-		fileMap: make(map[string]*FileState),
-		mu:      new(sync.Mutex),
-		wg:      new(sync.WaitGroup),
+		files:      files,
+		fileIdx:    0,
+		mapTaskCnt: NMap,
+		mu:         new(sync.RWMutex),
+		cmu:        new(sync.Mutex),
+		wg:         new(sync.WaitGroup),
 	}
-	c.mapDone.Store(false)
-	c.mapTaskCnt.Store(int32(len(files)))
 	c.reduceTaskCnt.Store(int32(nReduce))
-	c.wg.Add(len(files) + nReduce)
-	for i, fn := range files {
-		c.fileMap[fn] = &FileState{started: false, idx: i}
-	}
+	c.cond = sync.NewCond(c.cmu)
+	c.wg.Add(NMap + nReduce)
 
 	c.server()
 	return &c

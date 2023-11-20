@@ -21,7 +21,6 @@ type TaskType uint8
 const (
 	kTaskTypeMap TaskType = iota
 	kTaskTypeReduce
-	kTaskTypeWait
 	kTaskTypeNone
 )
 

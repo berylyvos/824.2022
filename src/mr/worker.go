@@ -11,7 +11,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 )
 
 const tmpFilePrefix = "mr-"
@@ -138,18 +137,12 @@ func Worker(mapf func(string, string) []KeyValue,
 			} else if reply.Type == kTaskTypeReduce {
 				doReduce(reducef, &reply)
 				args.TaskDone = true
-			} else if reply.Type == kTaskTypeWait {
-				time.Sleep(time.Millisecond * 800)
-				args.TaskDone = false
-				continue
 			} else {
 				break
 			}
 		} else {
 			fmt.Printf("worker %v call failed!\n", args.WorkerPid)
 		}
-
-		// time.Sleep(time.Millisecond * 200)
 	}
 }
 
