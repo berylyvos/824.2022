@@ -11,6 +11,20 @@ import (
 	"strconv"
 )
 
+const (
+	NMap    int = 8
+	NReduce int = 10
+)
+
+type TaskType uint8
+
+const (
+	kTaskTypeMap TaskType = iota
+	kTaskTypeReduce
+	kTaskTypeWait
+	kTaskTypeNone
+)
+
 //
 // example to show how to declare the arguments
 // and reply for an RPC.
@@ -26,12 +40,13 @@ type ExampleReply struct {
 
 type TaskArg struct {
 	WorkerPid int
+	TaskDone  bool
 }
 
 type TaskReply struct {
+	Type          TaskType
 	InputFileName string
-	MapTaskIndex  int
-	NReduce       int
+	TaskIndex     int
 }
 
 // Cook up a unique-ish UNIX-domain socket name
