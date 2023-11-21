@@ -315,6 +315,7 @@ else
   echo '---' crash test: FAIL
   failed_any=1
 fi
+rm -rf mr-*
 
 #########################################################
 if [ $failed_any -eq 0 ]; then

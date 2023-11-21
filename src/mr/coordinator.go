@@ -8,18 +8,97 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
+type TaskState struct {
+	WorkerPid int
+	fileName  string
+	started   bool
+	finished  bool
+}
+
 type Coordinator struct {
-	files         []string
-	fileIdx       int
-	mu            *sync.RWMutex
+	timeTable     map[int]time.Time
+	tmu           *sync.Mutex
+	mapTasks      []*TaskState
+	reduceTasks   []*TaskState
+	mmu           *sync.Mutex
+	rmu           *sync.Mutex
 	cmu           *sync.Mutex
-	cond          *sync.Cond
 	mapTaskCnt    int
+	mapDone       atomic.Bool
 	reduceTaskCnt atomic.Int32
 	allDone       atomic.Bool
 	wg            *sync.WaitGroup
+}
+
+func (c *Coordinator) allocMapTask(workerPid int, reply *TaskReply) bool {
+	c.mmu.Lock()
+	defer c.mmu.Unlock()
+	for i := 0; i < NMap; i++ {
+		if !c.mapTasks[i].started {
+			reply.TaskIndex = i
+			reply.InputFileName = c.mapTasks[i].fileName
+			c.mapTasks[i].started = true
+			c.mapTasks[i].WorkerPid = workerPid
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Coordinator) allocReduceTask(workerPid int, reply *TaskReply) bool {
+	c.rmu.Lock()
+	defer c.rmu.Unlock()
+	for i := 0; i < NReduce; i++ {
+		if !c.reduceTasks[i].started {
+			reply.TaskIndex = i
+			c.reduceTasks[i].started = true
+			c.reduceTasks[i].WorkerPid = workerPid
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Coordinator) recycleUnDoneTask(workerPid int) {
+	if !c.mapDone.Load() {
+		c.mmu.Lock()
+		for i := 0; i < NMap; i++ {
+			if c.mapTasks[i].WorkerPid == workerPid &&
+				c.mapTasks[i].started && !c.mapTasks[i].finished {
+				c.mapTasks[i].started = false
+				// log.Printf("Recycle Map task #%v", i)
+			}
+		}
+		c.mmu.Unlock()
+	}
+
+	c.rmu.Lock()
+	for i := 0; i < NReduce; i++ {
+		if c.reduceTasks[i].WorkerPid == workerPid &&
+			c.reduceTasks[i].started && !c.reduceTasks[i].finished {
+			c.reduceTasks[i].started = false
+			// log.Printf("Recycle Reduce task #%v", i)
+		}
+	}
+	c.rmu.Unlock()
+}
+
+func (c *Coordinator) checkCrashWorker() {
+	for {
+		tm := time.NewTimer(time.Second * 5)
+		now := <-tm.C
+		c.tmu.Lock()
+		for wid, t := range c.timeTable {
+			if t.Add(time.Second * 10).Before(now) {
+				c.recycleUnDoneTask(wid)
+			}
+		}
+		c.tmu.Unlock()
+		tm.Reset(time.Second * 5)
+	}
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -29,49 +108,45 @@ func (c *Coordinator) HandleTaskRequest(args *TaskArg, reply *TaskReply) error {
 		return nil
 	}
 
+	c.tmu.Lock()
+	c.timeTable[args.WorkerPid] = time.Now()
+	c.tmu.Unlock()
+
 	if args.TaskDone {
 		c.wg.Done()
-		c.cmu.Lock()
-		if c.mapTaskCnt > 0 {
+
+		if args.TaskDoneType == kTaskTypeMap {
+			c.mmu.Lock()
+			c.mapTasks[args.TaskIndex].finished = true
+			c.mmu.Unlock()
+
+			c.cmu.Lock()
 			c.mapTaskCnt--
 			if c.mapTaskCnt == 0 {
-				c.cond.Broadcast()
+				c.mapDone.Store(true)
 			}
+			c.cmu.Unlock()
+		} else if args.TaskDoneType == kTaskTypeReduce {
+			c.rmu.Lock()
+			c.reduceTasks[args.TaskIndex].finished = true
+			c.rmu.Unlock()
 		}
-		c.cmu.Unlock()
 	}
 
-	c.mu.RLock()
-	idx := c.fileIdx
-	c.mu.RUnlock()
-
-	if idx >= NMap {
-		c.cmu.Lock()
-		for c.mapTaskCnt > 0 {
-			c.cond.Wait()
+	if !c.mapDone.Load() {
+		if c.allocMapTask(args.WorkerPid, reply) {
+			reply.Type = kTaskTypeMap
+			// log.Printf("Map task #%v -> worker [%v]", reply.TaskIndex, args.WorkerPid)
+			return nil
 		}
-		c.cmu.Unlock()
-
-		reduceIdx := c.reduceTaskCnt.Add(-1)
-		if reduceIdx < 0 {
-			reply.Type = kTaskTypeNone
-			log.Println("No task to distribute!")
-		} else {
-			log.Printf("Reduce task #%v -> worker [%v]", reduceIdx, args.WorkerPid)
-			reply.Type = kTaskTypeReduce
-			reply.TaskIndex = int(reduceIdx)
-		}
-	} else {
-		c.mu.Lock()
-		reply.TaskIndex = c.fileIdx
-		reply.InputFileName = c.files[c.fileIdx]
-		c.fileIdx++
-		c.mu.Unlock()
-
-		reply.Type = kTaskTypeMap
-		log.Printf("Map task #%v -> worker [%v]", reply.TaskIndex, args.WorkerPid)
+	} else if c.allocReduceTask(args.WorkerPid, reply) {
+		reply.Type = kTaskTypeReduce
+		// log.Printf("Reduce task #%v -> worker [%v]", reply.TaskIndex, args.WorkerPid)
+		return nil
 	}
 
+	reply.Type = kTaskTypeNone
+	// log.Printf("No task to distribute to worker [%v]", args.WorkerPid)
 	return nil
 }
 
@@ -114,18 +189,39 @@ func (c *Coordinator) Done() bool {
 // nReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{
-		files:      files,
-		fileIdx:    0,
-		mapTaskCnt: NMap,
-		mu:         new(sync.RWMutex),
-		cmu:        new(sync.Mutex),
-		wg:         new(sync.WaitGroup),
+		timeTable:   make(map[int]time.Time),
+		mapTasks:    make([]*TaskState, 0, NMap),
+		reduceTasks: make([]*TaskState, 0, nReduce),
+		mapTaskCnt:  NMap,
+		tmu:         new(sync.Mutex),
+		mmu:         new(sync.Mutex),
+		rmu:         new(sync.Mutex),
+		cmu:         new(sync.Mutex),
+		wg:          new(sync.WaitGroup),
 	}
+
+	for i := 0; i < NMap; i++ {
+		c.mapTasks = append(c.mapTasks, &TaskState{
+			fileName: files[i],
+			started:  false,
+			finished: false,
+		})
+	}
+
+	for i := 0; i < nReduce; i++ {
+		c.reduceTasks = append(c.reduceTasks, &TaskState{
+			started:  false,
+			finished: false,
+		})
+	}
+
 	c.reduceTaskCnt.Store(int32(nReduce))
-	c.cond = sync.NewCond(c.cmu)
-	c.wg.Add(NMap + nReduce)
+	c.mapDone.Store(false)
 	c.allDone.Store(false)
+	c.wg.Add(NMap + nReduce)
 
 	c.server()
+	go c.checkCrashWorker()
+
 	return &c
 }

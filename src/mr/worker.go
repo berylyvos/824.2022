@@ -135,9 +135,13 @@ func Worker(mapf func(string, string) []KeyValue,
 			if reply.Type == kTaskTypeMap {
 				doMap(mapf, &reply)
 				args.TaskDone = true
+				args.TaskIndex = reply.TaskIndex
+				args.TaskDoneType = kTaskTypeMap
 			} else if reply.Type == kTaskTypeReduce {
 				doReduce(reducef, &reply)
 				args.TaskDone = true
+				args.TaskIndex = reply.TaskIndex
+				args.TaskDoneType = kTaskTypeReduce
 			} else if reply.Type == kTaskTypeNone {
 				time.Sleep(time.Second)
 				args.TaskDone = false

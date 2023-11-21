@@ -111,4 +111,4 @@ else
   echo '---' early exit test: FAIL
   failed_any=1
 fi
-# rm -f mr-*
+rm -f mr-*

@@ -39,8 +39,10 @@ type ExampleReply struct {
 }
 
 type TaskArg struct {
-	WorkerPid int
-	TaskDone  bool
+	WorkerPid    int
+	TaskDone     bool
+	TaskDoneType TaskType
+	TaskIndex    int
 }
 
 type TaskReply struct {
