@@ -22,6 +22,7 @@ const (
 	kTaskTypeMap TaskType = iota
 	kTaskTypeReduce
 	kTaskTypeNone
+	kTaskTypeExit
 )
 
 //

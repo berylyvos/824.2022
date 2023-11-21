@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const tmpFilePrefix = "mr-"
@@ -137,13 +138,18 @@ func Worker(mapf func(string, string) []KeyValue,
 			} else if reply.Type == kTaskTypeReduce {
 				doReduce(reducef, &reply)
 				args.TaskDone = true
+			} else if reply.Type == kTaskTypeNone {
+				time.Sleep(time.Second)
+				args.TaskDone = false
 			} else {
 				break
 			}
 		} else {
-			fmt.Printf("worker %v call failed!\n", args.WorkerPid)
+			log.Printf("worker %v call failed!\n", args.WorkerPid)
 		}
 	}
+
+	log.Printf("worker [%v] exit...", args.WorkerPid)
 }
 
 // example function to show how to make an RPC call to the coordinator.

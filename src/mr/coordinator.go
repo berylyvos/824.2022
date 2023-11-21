@@ -18,17 +18,25 @@ type Coordinator struct {
 	cond          *sync.Cond
 	mapTaskCnt    int
 	reduceTaskCnt atomic.Int32
+	allDone       atomic.Bool
 	wg            *sync.WaitGroup
 }
 
 // Your code here -- RPC handlers for the worker to call.
 func (c *Coordinator) HandleTaskRequest(args *TaskArg, reply *TaskReply) error {
+	if c.allDone.Load() {
+		reply.Type = kTaskTypeExit
+		return nil
+	}
+
 	if args.TaskDone {
 		c.wg.Done()
 		c.cmu.Lock()
-		c.mapTaskCnt--
-		if c.mapTaskCnt == 0 {
-			c.cond.Broadcast()
+		if c.mapTaskCnt > 0 {
+			c.mapTaskCnt--
+			if c.mapTaskCnt == 0 {
+				c.cond.Broadcast()
+			}
 		}
 		c.cmu.Unlock()
 	}
@@ -95,6 +103,9 @@ func (c *Coordinator) Done() bool {
 
 	c.wg.Wait()
 
+	c.allDone.Store(true)
+	log.Println("Coordinator Exit...")
+
 	return true
 }
 
@@ -113,6 +124,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c.reduceTaskCnt.Store(int32(nReduce))
 	c.cond = sync.NewCond(c.cmu)
 	c.wg.Add(NMap + nReduce)
+	c.allDone.Store(false)
 
 	c.server()
 	return &c
