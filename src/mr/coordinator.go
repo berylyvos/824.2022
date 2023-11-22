@@ -25,8 +25,7 @@ type Coordinator struct {
 	reduceTasks   []*TaskState
 	mmu           *sync.Mutex
 	rmu           *sync.Mutex
-	cmu           *sync.Mutex
-	mapTaskCnt    int
+	mapTaskCnt    atomic.Int32
 	mapDone       atomic.Bool
 	reduceTaskCnt atomic.Int32
 	allDone       atomic.Bool
@@ -69,7 +68,7 @@ func (c *Coordinator) recycleUnDoneTask(workerPid int) {
 			if c.mapTasks[i].WorkerPid == workerPid &&
 				c.mapTasks[i].started && !c.mapTasks[i].finished {
 				c.mapTasks[i].started = false
-				// log.Printf("Recycle Map task #%v", i)
+				log.Printf("Recycle Map task #%v", i)
 			}
 		}
 		c.mmu.Unlock()
@@ -80,7 +79,7 @@ func (c *Coordinator) recycleUnDoneTask(workerPid int) {
 		if c.reduceTasks[i].WorkerPid == workerPid &&
 			c.reduceTasks[i].started && !c.reduceTasks[i].finished {
 			c.reduceTasks[i].started = false
-			// log.Printf("Recycle Reduce task #%v", i)
+			log.Printf("Recycle Reduce task #%v", i)
 		}
 	}
 	c.rmu.Unlock()
@@ -120,12 +119,9 @@ func (c *Coordinator) HandleTaskRequest(args *TaskArg, reply *TaskReply) error {
 			c.mapTasks[args.TaskIndex].finished = true
 			c.mmu.Unlock()
 
-			c.cmu.Lock()
-			c.mapTaskCnt--
-			if c.mapTaskCnt == 0 {
+			if c.mapTaskCnt.Add(-1) == 0 {
 				c.mapDone.Store(true)
 			}
-			c.cmu.Unlock()
 		} else if args.TaskDoneType == kTaskTypeReduce {
 			c.rmu.Lock()
 			c.reduceTasks[args.TaskIndex].finished = true
@@ -146,7 +142,7 @@ func (c *Coordinator) HandleTaskRequest(args *TaskArg, reply *TaskReply) error {
 	}
 
 	reply.Type = kTaskTypeNone
-	// log.Printf("No task to distribute to worker [%v]", args.WorkerPid)
+	log.Printf("No task to distribute to worker [%v]", args.WorkerPid)
 	return nil
 }
 
@@ -192,11 +188,9 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		timeTable:   make(map[int]time.Time),
 		mapTasks:    make([]*TaskState, 0, NMap),
 		reduceTasks: make([]*TaskState, 0, nReduce),
-		mapTaskCnt:  NMap,
 		tmu:         new(sync.Mutex),
 		mmu:         new(sync.Mutex),
 		rmu:         new(sync.Mutex),
-		cmu:         new(sync.Mutex),
 		wg:          new(sync.WaitGroup),
 	}
 
@@ -215,6 +209,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		})
 	}
 
+	c.mapTaskCnt.Store(int32(NMap))
 	c.reduceTaskCnt.Store(int32(nReduce))
 	c.mapDone.Store(false)
 	c.allDone.Store(false)

@@ -143,14 +143,17 @@ func Worker(mapf func(string, string) []KeyValue,
 				args.TaskIndex = reply.TaskIndex
 				args.TaskDoneType = kTaskTypeReduce
 			} else if reply.Type == kTaskTypeNone {
-				time.Sleep(time.Second)
+				time.Sleep(time.Second * 3)
 				args.TaskDone = false
 			} else {
 				break
 			}
 		} else {
-			log.Printf("worker %v call failed!\n", args.WorkerPid)
+			// log.Printf("worker %v call failed!\n", args.WorkerPid)
+			break
 		}
+
+		time.Sleep(time.Millisecond * 500)
 	}
 
 	log.Printf("worker [%v] exit...", args.WorkerPid)
@@ -191,7 +194,8 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	sockname := coordinatorSock()
 	c, err := rpc.DialHTTP("unix", sockname)
 	if err != nil {
-		log.Fatal("dialing:", err)
+		// log.Fatal("dialing:", err)
+		return false
 	}
 	defer c.Close()
 
