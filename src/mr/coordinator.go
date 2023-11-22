@@ -86,18 +86,20 @@ func (c *Coordinator) recycleUnDoneTask(workerPid int) {
 }
 
 func (c *Coordinator) checkCrashWorker() {
-	for {
+	go func() {
 		tm := time.NewTimer(time.Second * 5)
-		now := <-tm.C
-		c.tmu.Lock()
-		for wid, t := range c.timeTable {
-			if t.Add(time.Second * 10).Before(now) {
-				c.recycleUnDoneTask(wid)
+		for {
+			now := <-tm.C
+			c.tmu.Lock()
+			for wid, t := range c.timeTable {
+				if t.Add(time.Second * 10).Before(now) {
+					c.recycleUnDoneTask(wid)
+				}
 			}
+			c.tmu.Unlock()
+			tm.Reset(time.Second * 5)
 		}
-		c.tmu.Unlock()
-		tm.Reset(time.Second * 5)
-	}
+	}()
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -216,7 +218,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c.wg.Add(NMap + nReduce)
 
 	c.server()
-	go c.checkCrashWorker()
+	c.checkCrashWorker()
 
 	return &c
 }
