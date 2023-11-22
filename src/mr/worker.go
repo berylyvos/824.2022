@@ -9,12 +9,8 @@ import (
 	"net/rpc"
 	"os"
 	"sort"
-	"strconv"
-	"strings"
 	"time"
 )
-
-const tmpFilePrefix = "mr-"
 
 // for sorting by key.
 type ByKey []KeyValue
@@ -38,6 +34,14 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
+func intermediateFileName(x, y int) string {
+	return fmt.Sprintf("mr-%d-%d", x, y)
+}
+
+func outputFileName(x int) string {
+	return fmt.Sprintf("mr-out-%d", x)
+}
+
 func doMap(mapf func(string, string) []KeyValue, reply *TaskReply) {
 	log.Printf("worker [%v] doMap #%v", os.Getpid(), reply.TaskIndex)
 
@@ -52,50 +56,45 @@ func doMap(mapf func(string, string) []KeyValue, reply *TaskReply) {
 	}
 	f.Close()
 
-	intermediateFileName := fmt.Sprintf("mr-%d-", reply.TaskIndex)
 	kva := mapf(filename, string(content))
+	mkva := make(map[int][]KeyValue)
 	for _, kv := range kva {
 		reduceIdx := ihash(kv.Key) % NReduce
-		fn := intermediateFileName + strconv.Itoa(reduceIdx)
-		intermediateFile, err := os.OpenFile(fn, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
-		if err != nil {
-			log.Fatalf("cannot open %v, %v", fn, err)
-		}
+		mkva[reduceIdx] = append(mkva[reduceIdx], kv)
+	}
 
-		enc := json.NewEncoder(intermediateFile)
-		enc.Encode(&kv)
-		intermediateFile.Close()
+	for i := 0; i < NReduce; i++ {
+		f, _ := os.Create(intermediateFileName(reply.TaskIndex, i))
+		enc := json.NewEncoder(f)
+		for _, kv := range mkva[i] {
+			enc.Encode(&kv)
+		}
+		f.Close()
 	}
 }
 
 func doReduce(reducef func(string, []string) string, reply *TaskReply) {
 	log.Printf("worker [%v] doReduce #%v", os.Getpid(), reply.TaskIndex)
 
-	reduceIdx := strconv.Itoa(reply.TaskIndex)
-	oname := "mr-out-" + reduceIdx
-	ofile, _ := os.Create(oname)
 	kva := []KeyValue{}
 
-	dir, _ := os.ReadDir(".")
-	for _, e := range dir {
-		fn := e.Name()
-		// mr-*-[reduceIdx]
-		if strings.HasPrefix(fn, tmpFilePrefix) &&
-			strings.HasSuffix(fn, reduceIdx) {
-			f, err := os.Open(fn)
-			if err != nil {
-				log.Fatalf("cannot open %v", fn)
+	for i := 0; i < NMap; i++ {
+		fn := intermediateFileName(i, reply.TaskIndex)
+		f, err := os.Open(fn)
+		if err != nil {
+			log.Fatalf("cannot open %v", fn)
+		}
+		dec := json.NewDecoder(f)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
 			}
-			dec := json.NewDecoder(f)
-			for {
-				var kv KeyValue
-				if err := dec.Decode(&kv); err != nil {
-					break
-				}
-				kva = append(kva, kv)
-			}
+			kva = append(kva, kv)
 		}
 	}
+
+	ofile, _ := os.Create(outputFileName(reply.TaskIndex))
 
 	sort.Sort(ByKey(kva))
 	i, sz := 0, len(kva)
