@@ -11,78 +11,88 @@ import (
 	"time"
 )
 
-type TaskState struct {
-	WorkerPid int
-	fileName  string
+type MRTask struct {
+	idx       int
+	workerPid int
 	started   bool
 	finished  bool
+	fileName  string
 }
 
 type Coordinator struct {
-	timeTable     map[int]time.Time
-	tmu           *sync.Mutex
-	mapTasks      []*TaskState
-	reduceTasks   []*TaskState
-	mmu           *sync.Mutex
-	rmu           *sync.Mutex
-	mapTaskCnt    atomic.Int32
-	mapDone       atomic.Bool
-	reduceTaskCnt atomic.Int32
-	allDone       atomic.Bool
-	wg            *sync.WaitGroup
+	timeTable map[int]time.Time
+	tmu       *sync.Mutex
+
+	mapTasks    []MRTask
+	reduceTasks []MRTask
+	mmu         *sync.Mutex
+	rmu         *sync.Mutex
+	mapChan     chan MRTask
+	reduceChan  chan MRTask
+
+	mapTaskCnt atomic.Int32
+	mapDone    atomic.Bool
+	allDone    atomic.Bool
+	wg         *sync.WaitGroup
 }
 
 func (c *Coordinator) allocMapTask(workerPid int, reply *TaskReply) bool {
-	c.mmu.Lock()
-	defer c.mmu.Unlock()
-	for i := 0; i < NMap; i++ {
-		if !c.mapTasks[i].started {
-			reply.TaskIndex = i
-			reply.InputFileName = c.mapTasks[i].fileName
-			c.mapTasks[i].started = true
-			c.mapTasks[i].WorkerPid = workerPid
-			return true
-		}
+	if len(c.mapChan) == 0 {
+		return false
 	}
-	return false
+
+	task := <-c.mapChan
+	reply.Type = kTaskTypeMap
+	reply.TaskIndex = task.idx
+	reply.InputFileName = task.fileName
+	c.mmu.Lock()
+	c.mapTasks[task.idx].started = true
+	c.mapTasks[task.idx].workerPid = workerPid
+	c.mmu.Unlock()
+	return true
 }
 
 func (c *Coordinator) allocReduceTask(workerPid int, reply *TaskReply) bool {
-	c.rmu.Lock()
-	defer c.rmu.Unlock()
-	for i := 0; i < NReduce; i++ {
-		if !c.reduceTasks[i].started {
-			reply.TaskIndex = i
-			c.reduceTasks[i].started = true
-			c.reduceTasks[i].WorkerPid = workerPid
-			return true
-		}
+	if len(c.reduceChan) == 0 {
+		return false
 	}
-	return false
+
+	task := <-c.reduceChan
+	reply.Type = kTaskTypeReduce
+	reply.TaskIndex = task.idx
+	c.rmu.Lock()
+	c.reduceTasks[task.idx].started = true
+	c.reduceTasks[task.idx].workerPid = workerPid
+	c.rmu.Unlock()
+	return true
 }
 
 func (c *Coordinator) recycleUnDoneTask(workerPid int) {
 	if !c.mapDone.Load() {
 		c.mmu.Lock()
 		for i := 0; i < NMap; i++ {
-			if c.mapTasks[i].WorkerPid == workerPid &&
+			if c.mapTasks[i].workerPid == workerPid &&
 				c.mapTasks[i].started && !c.mapTasks[i].finished {
 				c.mapTasks[i].started = false
+				c.mapChan <- c.mapTasks[i]
 				log.Printf("Recycle Map task #%v", i)
+				break
 			}
 		}
 		c.mmu.Unlock()
-	}
-
-	c.rmu.Lock()
-	for i := 0; i < NReduce; i++ {
-		if c.reduceTasks[i].WorkerPid == workerPid &&
-			c.reduceTasks[i].started && !c.reduceTasks[i].finished {
-			c.reduceTasks[i].started = false
-			log.Printf("Recycle Reduce task #%v", i)
+	} else {
+		c.rmu.Lock()
+		for i := 0; i < NReduce; i++ {
+			if c.reduceTasks[i].workerPid == workerPid &&
+				c.reduceTasks[i].started && !c.reduceTasks[i].finished {
+				c.reduceTasks[i].started = false
+				c.reduceChan <- c.reduceTasks[i]
+				log.Printf("Recycle Reduce task #%v", i)
+				break
+			}
 		}
+		c.rmu.Unlock()
 	}
-	c.rmu.Unlock()
 }
 
 func (c *Coordinator) checkCrashWorker() {
@@ -133,13 +143,9 @@ func (c *Coordinator) HandleTaskRequest(args *TaskArg, reply *TaskReply) error {
 
 	if !c.mapDone.Load() {
 		if c.allocMapTask(args.WorkerPid, reply) {
-			reply.Type = kTaskTypeMap
-			// log.Printf("Map task #%v -> worker [%v]", reply.TaskIndex, args.WorkerPid)
 			return nil
 		}
 	} else if c.allocReduceTask(args.WorkerPid, reply) {
-		reply.Type = kTaskTypeReduce
-		// log.Printf("Reduce task #%v -> worker [%v]", reply.TaskIndex, args.WorkerPid)
 		return nil
 	}
 
@@ -188,8 +194,10 @@ func (c *Coordinator) Done() bool {
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{
 		timeTable:   make(map[int]time.Time),
-		mapTasks:    make([]*TaskState, 0, NMap),
-		reduceTasks: make([]*TaskState, 0, nReduce),
+		mapTasks:    make([]MRTask, 0, NMap),
+		reduceTasks: make([]MRTask, 0, nReduce),
+		mapChan:     make(chan MRTask, NMap),
+		reduceChan:  make(chan MRTask, nReduce),
 		tmu:         new(sync.Mutex),
 		mmu:         new(sync.Mutex),
 		rmu:         new(sync.Mutex),
@@ -197,22 +205,27 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	}
 
 	for i := 0; i < NMap; i++ {
-		c.mapTasks = append(c.mapTasks, &TaskState{
-			fileName: files[i],
+		task := MRTask{
+			idx:      i,
 			started:  false,
 			finished: false,
-		})
+			fileName: files[i],
+		}
+		c.mapTasks = append(c.mapTasks, task)
+		c.mapChan <- task
 	}
 
 	for i := 0; i < nReduce; i++ {
-		c.reduceTasks = append(c.reduceTasks, &TaskState{
+		task := MRTask{
+			idx:      i,
 			started:  false,
 			finished: false,
-		})
+		}
+		c.reduceTasks = append(c.reduceTasks, task)
+		c.reduceChan <- task
 	}
 
 	c.mapTaskCnt.Store(int32(NMap))
-	c.reduceTaskCnt.Store(int32(nReduce))
 	c.mapDone.Store(false)
 	c.allDone.Store(false)
 	c.wg.Add(NMap + nReduce)

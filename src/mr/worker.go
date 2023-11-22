@@ -131,24 +131,25 @@ func Worker(mapf func(string, string) []KeyValue,
 
 		ok := call("Coordinator.HandleTaskRequest", &args, &reply)
 		if ok {
-			if reply.Type == kTaskTypeMap {
+			switch reply.Type {
+			case kTaskTypeMap:
 				doMap(mapf, &reply)
 				args.TaskDone = true
 				args.TaskIndex = reply.TaskIndex
 				args.TaskDoneType = kTaskTypeMap
-			} else if reply.Type == kTaskTypeReduce {
+			case kTaskTypeReduce:
 				doReduce(reducef, &reply)
 				args.TaskDone = true
 				args.TaskIndex = reply.TaskIndex
 				args.TaskDoneType = kTaskTypeReduce
-			} else if reply.Type == kTaskTypeNone {
+			case kTaskTypeNone:
 				time.Sleep(time.Second * 3)
 				args.TaskDone = false
-			} else {
-				break
+			case kTaskTypeExit:
+				log.Printf("worker [%v] exit...", args.WorkerPid)
+				return
 			}
 		} else {
-			// log.Printf("worker %v call failed!\n", args.WorkerPid)
 			break
 		}
 
