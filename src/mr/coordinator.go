@@ -11,29 +11,40 @@ import (
 	"time"
 )
 
-type MRTask struct {
-	idx       int
-	workerPid int
-	started   bool
-	finished  bool
-	fileName  string
-}
+const (
+	PhaseMap = iota
+	PhaseReduce
+	PhaseDone
+)
+
+const (
+	TaskInit TaskState = iota
+	TaskStart
+	TaskFinish
+)
+
+type (
+	TaskState uint8
+
+	MRTask struct {
+		idx       int
+		workerPid int
+		state     TaskState
+		fileName  string
+	}
+)
 
 type Coordinator struct {
-	timeTable map[int]time.Time
-	tmu       *sync.Mutex
-
 	mapTasks    []MRTask
 	reduceTasks []MRTask
 	mmu         *sync.Mutex
 	rmu         *sync.Mutex
 	mapChan     chan MRTask
 	reduceChan  chan MRTask
-
-	mapTaskCnt atomic.Int32
-	mapDone    atomic.Bool
-	allDone    atomic.Bool
-	wg         *sync.WaitGroup
+	mapTaskCnt  atomic.Int32
+	phase       atomic.Uint32
+	wg          *sync.WaitGroup
+	timeTable   *sync.Map
 }
 
 func (c *Coordinator) allocMapTask(workerPid int, reply *TaskReply) bool {
@@ -46,7 +57,7 @@ func (c *Coordinator) allocMapTask(workerPid int, reply *TaskReply) bool {
 	reply.TaskIndex = task.idx
 	reply.InputFileName = task.fileName
 	c.mmu.Lock()
-	c.mapTasks[task.idx].started = true
+	c.mapTasks[task.idx].state = TaskStart
 	c.mapTasks[task.idx].workerPid = workerPid
 	c.mmu.Unlock()
 	return true
@@ -61,19 +72,18 @@ func (c *Coordinator) allocReduceTask(workerPid int, reply *TaskReply) bool {
 	reply.Type = kTaskTypeReduce
 	reply.TaskIndex = task.idx
 	c.rmu.Lock()
-	c.reduceTasks[task.idx].started = true
+	c.reduceTasks[task.idx].state = TaskStart
 	c.reduceTasks[task.idx].workerPid = workerPid
 	c.rmu.Unlock()
 	return true
 }
 
 func (c *Coordinator) recycleUnDoneTask(workerPid int) {
-	if !c.mapDone.Load() {
+	if c.phase.Load() == PhaseMap {
 		c.mmu.Lock()
 		for i := 0; i < NMap; i++ {
 			if c.mapTasks[i].workerPid == workerPid &&
-				c.mapTasks[i].started && !c.mapTasks[i].finished {
-				c.mapTasks[i].started = false
+				c.mapTasks[i].state == TaskStart {
 				c.mapChan <- c.mapTasks[i]
 				log.Printf("Recycle Map task #%v", i)
 				break
@@ -84,8 +94,7 @@ func (c *Coordinator) recycleUnDoneTask(workerPid int) {
 		c.rmu.Lock()
 		for i := 0; i < NReduce; i++ {
 			if c.reduceTasks[i].workerPid == workerPid &&
-				c.reduceTasks[i].started && !c.reduceTasks[i].finished {
-				c.reduceTasks[i].started = false
+				c.reduceTasks[i].state == TaskStart {
 				c.reduceChan <- c.reduceTasks[i]
 				log.Printf("Recycle Reduce task #%v", i)
 				break
@@ -100,13 +109,14 @@ func (c *Coordinator) checkCrashWorker() {
 		tm := time.NewTimer(time.Second * 5)
 		for {
 			now := <-tm.C
-			c.tmu.Lock()
-			for wid, t := range c.timeTable {
-				if t.Add(time.Second * 10).Before(now) {
-					c.recycleUnDoneTask(wid)
+			c.timeTable.Range(func(k, v interface{}) bool {
+				workerPid := k.(int)
+				lastRequestTime := v.(time.Time)
+				if lastRequestTime.Add(time.Second * 10).Before(now) {
+					c.recycleUnDoneTask(workerPid)
 				}
-			}
-			c.tmu.Unlock()
+				return true
+			})
 			tm.Reset(time.Second * 5)
 		}
 	}()
@@ -114,34 +124,32 @@ func (c *Coordinator) checkCrashWorker() {
 
 // Your code here -- RPC handlers for the worker to call.
 func (c *Coordinator) HandleTaskRequest(args *TaskArg, reply *TaskReply) error {
-	if c.allDone.Load() {
+	if c.phase.Load() == PhaseDone {
 		reply.Type = kTaskTypeExit
 		return nil
 	}
 
-	c.tmu.Lock()
-	c.timeTable[args.WorkerPid] = time.Now()
-	c.tmu.Unlock()
+	c.timeTable.Store(args.WorkerPid, time.Now())
 
 	if args.TaskDone {
 		c.wg.Done()
 
 		if args.TaskDoneType == kTaskTypeMap {
 			c.mmu.Lock()
-			c.mapTasks[args.TaskIndex].finished = true
+			c.mapTasks[args.TaskIndex].state = TaskFinish
 			c.mmu.Unlock()
 
 			if c.mapTaskCnt.Add(-1) == 0 {
-				c.mapDone.Store(true)
+				c.phase.Store(PhaseReduce)
 			}
 		} else if args.TaskDoneType == kTaskTypeReduce {
 			c.rmu.Lock()
-			c.reduceTasks[args.TaskIndex].finished = true
+			c.reduceTasks[args.TaskIndex].state = TaskFinish
 			c.rmu.Unlock()
 		}
 	}
 
-	if !c.mapDone.Load() {
+	if c.phase.Load() == PhaseMap {
 		if c.allocMapTask(args.WorkerPid, reply) {
 			return nil
 		}
@@ -182,7 +190,7 @@ func (c *Coordinator) Done() bool {
 
 	c.wg.Wait()
 
-	c.allDone.Store(true)
+	c.phase.Store(PhaseDone)
 	log.Println("Coordinator Exit...")
 
 	return true
@@ -193,22 +201,20 @@ func (c *Coordinator) Done() bool {
 // nReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{
-		timeTable:   make(map[int]time.Time),
 		mapTasks:    make([]MRTask, 0, NMap),
 		reduceTasks: make([]MRTask, 0, nReduce),
 		mapChan:     make(chan MRTask, NMap),
 		reduceChan:  make(chan MRTask, nReduce),
-		tmu:         new(sync.Mutex),
 		mmu:         new(sync.Mutex),
 		rmu:         new(sync.Mutex),
 		wg:          new(sync.WaitGroup),
+		timeTable:   new(sync.Map),
 	}
 
 	for i := 0; i < NMap; i++ {
 		task := MRTask{
 			idx:      i,
-			started:  false,
-			finished: false,
+			state:    TaskInit,
 			fileName: files[i],
 		}
 		c.mapTasks = append(c.mapTasks, task)
@@ -217,17 +223,15 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 
 	for i := 0; i < nReduce; i++ {
 		task := MRTask{
-			idx:      i,
-			started:  false,
-			finished: false,
+			idx:   i,
+			state: TaskInit,
 		}
 		c.reduceTasks = append(c.reduceTasks, task)
 		c.reduceChan <- task
 	}
 
 	c.mapTaskCnt.Store(int32(NMap))
-	c.mapDone.Store(false)
-	c.allDone.Store(false)
+	c.phase.Store(PhaseMap)
 	c.wg.Add(NMap + nReduce)
 
 	c.server()
