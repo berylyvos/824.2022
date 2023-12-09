@@ -1,5 +1,7 @@
 # GFS
 
+GFS作为最著名的分布式文件系统，首先具备了大规模、可扩展、适配大文件、自动运维等高级特性，是分布式系统正式开始大规模商用的奠基之作。
+
 ## 系统架构
 
 - **GFS client**：维护专用接口，与应用交互。
@@ -188,7 +190,7 @@ master发起创建chunk副本的三种情况：新chunk创建、chunk副本复�
 
 GFS将文件数据的一致性大体分为：inconsistent，consistent，defined
 
-- **consistent**：文件无论从哪个副本读取，结果都是一样的。
+- **consistent**：文件无论从哪个chunk副本读取，结果都是一样的。
 - **defined**：文件发生了修改操作后，读取是一致的，且client还可以看到最新修改内容（在consistent的基础上，保证了与最新写入的一致）
   
 ![file_region_state_after_mutation.png](https://s2.loli.net/2023/12/08/PJDFiHBeQoOYRKN.png)
@@ -196,7 +198,7 @@ GFS将文件数据的一致性大体分为：inconsistent，consistent，defined
 - 串行改写成功：defined。因为所有副本都完成改写后才能返回成功，且重复执行不会产生副本间不一致。
 - 并发改写成功：consistent but undefined。并发改写操作可能会涉及到多个chunk，而不同chunk对改写的执行顺序不一定相同，进而导致应用读取不到预期的结果。
 - 写入失败：inconsistent。这通常发生在某个副本的chunkserver宕机时，无法在所有副本写入成功。
-- 追加写成功：defined interspersed with inconsistent（已定义但可能存在副本间的不一致）。追加的重读执行会造成副本间不一致。
+- 追加写成功：defined interspersed with inconsistent（已定义但可能存在副本间的不一致）。重复追加会造成副本间不一致。
 
 GFS为实现追加的一致性，对追加做了约束：
 
